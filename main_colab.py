@@ -1,279 +1,318 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
+"""
+main_colab.py
+
+Single-camera person detection + tracking + ROI-based counting.
+
+- Detector: YOLOv5s (torch.hub, pretrained on COCO)
+- Tracker:  SORT (sort.py in this repo)
+- Only persons whose bottom-center lies inside a given ROI rectangle
+  are tracked & counted.
+- Output: on-screen overlay (if display enabled) + optional MP4 video.
+"""
+
+import os
+import time
 import argparse
-import numpy as np
+
 import cv2
+import numpy as np
 import torch
-
-import sort
-import homography_tracker
-import utilities
-
-# ---------------------------------------------------------
-# ROI SETTINGS (in FULL-FRAME coordinates)
-# Format: (x1, y1, x2, y2)
-# Set to None to disable ROI for that camera.
-# ---------------------------------------------------------
-ROI1 = (500, 200, 1400, 900)   # example for cam1
-ROI2 = None                    # e.g. (400, 150, 1500, 900) or None
+from sort import Sort  # your existing tracker
 
 
-def apply_roi(frame, roi):
+# -----------------------
+# Helpers
+# -----------------------
+def parse_roi(roi_str):
     """
-    Return cropped frame and (x_offset, y_offset).
-    If roi is None, returns original frame and (0, 0).
+    Parse ROI string "x1,y1,x2,y2" into ints.
     """
-    if roi is None:
-        return frame, (0, 0)
+    try:
+        x1, y1, x2, y2 = map(int, roi_str.split(","))
+        return x1, y1, x2, y2
+    except Exception as e:
+        raise ValueError(f"Invalid ROI format '{roi_str}'. Use x1,y1,x2,y2") from e
 
+
+def is_inside_roi(cx, cy, roi):
+    """
+    Check if a point (cx, cy) lies inside ROI = (x1,y1,x2,y2).
+    """
     x1, y1, x2, y2 = roi
-    # Safety clamp
-    h, w = frame.shape[:2]
-    x1 = max(0, min(x1, w))
-    x2 = max(0, min(x2, w))
-    y1 = max(0, min(y1, h))
-    y2 = max(0, min(y2, h))
-
-    return frame[y1:y2, x1:x2], (x1, y1)
+    return (cx >= x1) and (cx <= x2) and (cy >= y1) and (cy <= y2)
 
 
+def color_from_id(id_):
+    """
+    Deterministic color for a given track id.
+    """
+    np.random.seed(int(id_ * 9973) & 0xFFFF)
+    return tuple(int(c) for c in np.random.randint(0, 255, size=3))
+
+
+# -----------------------
+# Main
+# -----------------------
 def main(opts):
     # -----------------------------
-    # Open videos
+    # 1. Open video
     # -----------------------------
-    video1 = cv2.VideoCapture(opts.video1)
-    assert video1.isOpened(), f"Could not open video1 source {opts.video1}"
-    video2 = cv2.VideoCapture(opts.video2)
-    assert video2.isOpened(), f"Could not open video2 source {opts.video2}"
+    cap = cv2.VideoCapture(opts.video1)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video source: {opts.video1}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
     # -----------------------------
-    # Load homography (cam1 -> cam4)
+    # 2. ROI parsing
     # -----------------------------
-    cam4_H_cam1 = np.load(opts.homography)
-    cam1_H_cam4 = np.linalg.inv(cam4_H_cam1)
+    if opts.roi:
+        roi = parse_roi(opts.roi)
+    else:
+        # If ROI is not specified, use full frame
+        roi = (0, 0, width - 1, height - 1)
 
-    # List of homographies per camera (camera 0 is identity)
-    homographies = [np.eye(3), cam1_H_cam4]
-
-    # -----------------------------
-    # Load YOLOv5 model (Ultralytics hub)
-    # -----------------------------
-    detector = torch.hub.load("ultralytics/yolov5", "yolov5m")
-    detector.agnostic = True        # class-agnostic NMS
-    detector.classes = [0]          # only "person"
-    detector.conf = opts.conf       # confidence threshold
+    print(f"[INFO] Using ROI rectangle: {roi}")
 
     # -----------------------------
-    # Initialize SORT trackers (per camera)
+    # 3. Detector (YOLOv5s – person only)
     # -----------------------------
-    trackers = [
-        sort.Sort(
-            max_age=opts.max_age,
-            min_hits=opts.min_hits,
-            iou_threshold=opts.iou_thres,
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cudnn.benchmark = True  # speed up CNN on constant input size
+
+    print("[INFO] Loading YOLOv5s from torch.hub...")
+    model = torch.hub.load(
+        "ultralytics/yolov5", "yolov5s", pretrained=True, verbose=False
+    ).to(device)
+
+    model.conf = opts.conf
+    model.agnostic = True
+    model.classes = [0]  # only "person"
+
+    if device == "cuda":
+        model.half()  # FP16 on GPU
+
+    # -----------------------------
+    # 4. Tracker (SORT)
+    # -----------------------------
+    tracker = Sort()  # you already patched sort.py in the notebook
+
+    # -----------------------------
+    # 5. Output video writer (optional)
+    # -----------------------------
+    writer = None
+    if opts.save_video:
+        os.makedirs(os.path.dirname(opts.save_video), exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            opts.save_video, fourcc, fps, (width, height)
         )
-        for _ in range(2)
-    ]
-
-    # Global multi-camera tracker
-    global_tracker = homography_tracker.MultiCameraTracker(
-        homographies, iou_thres=0.20
-    )
-
-    num_frames1 = int(video1.get(cv2.CAP_PROP_FRAME_COUNT))
-    num_frames2 = int(video2.get(cv2.CAP_PROP_FRAME_COUNT))
-    num_frames = min(num_frames1, num_frames2)
-
-    # cam4 video is ~17 frames behind cam1 in the original code
-    video2.set(cv2.CAP_PROP_POS_FRAMES, 17)
+        print(f"[INFO] Saving output video to: {opts.save_video}")
 
     # -----------------------------
-    # Video writer (side-by-side)
+    # 6. Runtime stats
     # -----------------------------
-    fps = video1.get(cv2.CAP_PROP_FPS) or 25.0
-    w = int(video1.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(video1.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_size = (w * 2, h)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(opts.output, fourcc, fps, out_size)
+    seen_ids = set()      # unique track IDs that ever entered ROI
+    frame_idx = 0
+    t0 = time.time()
 
     # -----------------------------
-    # (Optional) prediction logs for MOT-style evaluation
-    # preds_cam[i] = list of [frame, id, x, y, w, h, 1, -1, -1]
+    # 7. Main loop
     # -----------------------------
-    preds_cam = [[], []]  # 0 -> cam1, 1 -> cam4
-
-    print(f"[INFO] Processing up to {min(num_frames, opts.max_frames)} frames...")
-
-    for frame_idx in range(min(num_frames, opts.max_frames)):
-        ret1, frame1 = video1.read()
-        ret2, frame2 = video2.read()
-        if not (ret1 and ret2):
+    while True:
+        ret, frame = cap.read()
+        if not ret:
             break
 
-        # Keep full frames for drawing / homography
-        full_frames_bgr = [frame1.copy(), frame2.copy()]
+        frame_idx += 1
+
+        # Convert BGR -> RGB for YOLOv5
+        img_rgb = frame[:, :, ::-1]
+
+        # YOLO inference
+        with torch.no_grad():
+            results = model(img_rgb, size=opts.imgsz)
+        det = results.xyxy[0].detach().cpu().numpy()  # Nx6 [x1,y1,x2,y2,conf,cls]
+
+        # Filter: keep class 0 (person)
+        if det.shape[0] > 0:
+            person_mask = det[:, 5] == 0
+            det = det[person_mask]
+
+        # If no detections: update tracker with empty array
+        if det.shape[0] == 0:
+            det_for_sort = np.empty((0, 5), dtype=float)
+        else:
+            # -----------------------------
+            # ROI gating before tracking
+            # -----------------------------
+            x1_roi, y1_roi, x2_roi, y2_roi = roi
+            keep_idx = []
+            for i, d in enumerate(det):
+                x1, y1, x2, y2, conf, cls = d
+                cx = 0.5 * (x1 + x2)
+                cy = y2  # bottom-center
+                if is_inside_roi(cx, cy, roi):
+                    keep_idx.append(i)
+
+            if len(keep_idx) == 0:
+                det_for_sort = np.empty((0, 5), dtype=float)
+            else:
+                det = det[keep_idx]
+                # SORT wants [x1, y1, x2, y2, score]
+                det_for_sort = det[:, :5].astype(float)
 
         # -----------------------------
-        # Apply ROI cropping for detection
+        # Update tracker
         # -----------------------------
-        frame1_roi, offset1 = apply_roi(frame1, ROI1)
-        frame2_roi, offset2 = apply_roi(frame2, ROI2)
+        tracks = tracker.update(det_for_sort)  # (N, 5) = [x1,y1,x2,y2,track_id]
 
-        # YOLO expects RGB
-        frames_rgb = [frame1_roi[:, :, ::-1], frame2_roi[:, :, ::-1]]
-        anno = detector(frames_rgb)
+        current_ids = set()
 
-        dets_list = []
-        tracks_list = []
+        # Draw ROI
+        cv2.rectangle(
+            frame,
+            (roi[0], roi[1]),
+            (roi[2], roi[3]),
+            (0, 0, 255),
+            2,
+        )
 
-        # -----------------------------
-        # Per-camera detection & tracking
-        # -----------------------------
-        for cam_idx in range(len(anno)):
-            det_raw = anno.xyxy[cam_idx].cpu().numpy()  # x1,y1,x2,y2,conf,cls
+        # Draw tracks
+        for trk in tracks:
+            x1, y1, x2, y2, tid = trk
+            tid = int(tid)
 
-            if det_raw.size == 0:
-                # No detections: still need to update tracker with empty
-                empty_dets = np.empty((0, 5), dtype=float)
-                empty_labels = np.empty((0,), dtype=int)
-                trks = trackers[cam_idx].update(empty_dets, empty_labels)
-                tracks_list.append(trks)
-                dets_list.append(empty_dets)
+            # bottom-center for check (just to be safe if tracker drifts)
+            cx = 0.5 * (x1 + x2)
+            cy = y2
+            if not is_inside_roi(cx, cy, roi):
+                # we only consider tracks inside ROI for counting & drawing
                 continue
 
-            # Split YOLO output: [x1,y1,x2,y2,conf,cls]
-            boxes = det_raw[:, :4].astype(np.float32)
-            scores = det_raw[:, 4:5].astype(np.float32)  # (N,1)
-            labels = det_raw[:, 5].astype(int)           # class ids
+            current_ids.add(tid)
+            seen_ids.add(tid)
 
-            # Map boxes from ROI coords back to FULL frame
-            if cam_idx == 0:
-                x_off, y_off = offset1
-            else:
-                x_off, y_off = offset2
-
-            boxes[:, 0] += x_off  # x1
-            boxes[:, 2] += x_off  # x2
-            boxes[:, 1] += y_off  # y1
-            boxes[:, 3] += y_off  # y2
-
-            # Detections for SORT: [x1,y1,x2,y2,score]
-            det_for_sort = np.hstack([boxes, scores])
-
-            # Update SORT tracker (labels are class ids)
-            trks = trackers[cam_idx].update(det_for_sort, labels)
-
-            dets_list.append(det_for_sort)
-            tracks_list.append(trks)
-
-        # -----------------------------
-        # Multi-camera global ID assignment
-        # tracks_list: list of arrays [x1,y1,x2,y2,id,label] per camera
-        # global_ids[cam_idx] is a dict: local_id -> global_id
-        # -----------------------------
-        global_ids = global_tracker.update(tracks_list)
-
-        # -----------------------------
-        # (Optional) log predictions for evaluation (MOT format)
-        # -----------------------------
-        if opts.save_mot:
-            for cam_idx, trks in enumerate(tracks_list):
-                if trks.size == 0:
-                    continue
-                id_map = global_ids[cam_idx]
-                for t in trks:
-                    x1, y1, x2, y2, local_id, label = t
-                    global_id = id_map.get(int(local_id), int(local_id))
-                    w_box = x2 - x1
-                    h_box = y2 - y1
-                    # MOTChallenge: frame, id, x, y, w, h, conf(=1), -1, -1
-                    preds_cam[cam_idx].append(
-                        [
-                            frame_idx + 1,      # 1-based frame index
-                            int(global_id),
-                            float(x1),
-                            float(y1),
-                            float(w_box),
-                            float(h_box),
-                            1,
-                            -1,
-                            -1,
-                        ]
-                    )
-
-        # -----------------------------
-        # Draw tracks on FULL frames
-        # -----------------------------
-        vis_frames = []
-        for cam_idx in range(2):
-            vis = utilities.draw_tracks(
-                full_frames_bgr[cam_idx],
-                tracks_list[cam_idx],
-                global_ids[cam_idx],
-                cam_idx,
-                classes=detector.names,
+            color = color_from_id(tid)
+            x1i, y1i, x2i, y2i = int(x1), int(y1), int(x2), int(y2)
+            cv2.rectangle(frame, (x1i, y1i), (x2i, y2i), color, 2)
+            cv2.putText(
+                frame,
+                f"ID {tid}",
+                (x1i, y1i - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
             )
 
-            # (Optional) draw ROI rectangle for visualization
-            roi = ROI1 if cam_idx == 0 else ROI2
-            if roi is not None:
-                x1, y1, x2, y2 = roi
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        # -----------------------------
+        # Overlays: counts + FPS
+        # -----------------------------
+        elapsed = time.time() - t0
+        fps_est = frame_idx / elapsed if elapsed > 0 else 0.0
 
-            vis_frames.append(vis)
+        text1 = f"Frame {frame_idx} | In ROI now: {len(current_ids)}"
+        text2 = f"Unique persons in ROI: {len(seen_ids)}"
+        text3 = f"Approx FPS: {fps_est:.1f}"
 
-        # Side-by-side
-        vis_concat = np.hstack(vis_frames)
-        writer.write(vis_concat)
+        cv2.putText(
+            frame,
+            text1,
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            text2,
+            (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            text3,
+            (20, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
-        if frame_idx % 50 == 0:
-            print(f"[INFO] Processed frame {frame_idx}/{min(num_frames, opts.max_frames)}")
+        # Write output video if requested
+        if writer is not None:
+            writer.write(frame)
 
-    writer.release()
-    video1.release()
-    video2.release()
-    print(f"[INFO] Saved output video to {opts.output}")
+        # Optional display (disabled for Colab with --no-display)
+        if not opts.no_display:
+            cv2.imshow("Vis", frame)
+            key = cv2.waitKey(1)
+            if key == ord("q"):
+                break
 
-    # -----------------------------
-    # Save MOT-style prediction files (if requested)
-    # -----------------------------
-    if opts.save_mot:
-        for cam_idx in range(2):
-            out_path = f"{opts.pred_prefix}_cam{cam_idx+1}.txt"
-            with open(out_path, "w") as f:
-                for row in preds_cam[cam_idx]:
-                    line = ",".join(str(v) for v in row)
-                    f.write(line + "\n")
-            print(f"[INFO] Saved MOT predictions for cam{cam_idx+1} to {out_path}")
+    cap.release()
+    if writer is not None:
+        writer.release()
+    if not opts.no_display:
+        cv2.destroyAllWindows()
+
+    print("============================================")
+    print(f"Total frames processed: {frame_idx}")
+    print(f"Total unique persons in ROI: {len(seen_ids)}")
+    print("============================================")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video1", type=str, default="epfl/cam1.mp4")
-    parser.add_argument("--video2", type=str, default="epfl/cam4.mp4")
-    parser.add_argument("--homography", type=str, default="epfl/cam4_H_cam1.npy")
-    parser.add_argument("--output", type=str, default="epfl/mc_mot_output.mp4")
-    parser.add_argument("--iou-thres", type=float, default=0.3)
-    parser.add_argument("--max-age", type=int, default=30)
-    parser.add_argument("--min-hits", type=int, default=3)
-    parser.add_argument("--conf", type=float, default=0.30)
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=500,
-        help="Limit frames to process for faster demo.",
+    parser = argparse.ArgumentParser(
+        description="Single-camera person tracking with ROI (Colab-friendly)."
     )
     parser.add_argument(
-        "--save-mot",
-        action="store_true",
-        help="Save predictions in MOTChallenge txt format for evaluation.",
-    )
-    parser.add_argument(
-        "--pred-prefix",
+        "--video1",
         type=str,
-        default="epfl/pred",
-        help="Prefix for MOT .txt files (one per camera).",
+        required=True,
+        help="Path to input video (e.g. test.mp4)",
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.30,
+        help="YOLOv5 confidence threshold (default: 0.30)",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="Inference image size for YOLOv5 (default: 640)",
+    )
+    parser.add_argument(
+        "--roi",
+        type=str,
+        default="",
+        help='ROI rectangle as "x1,y1,x2,y2". If empty, full frame is used.',
+    )
+    parser.add_argument(
+        "--save-video",
+        type=str,
+        default="",
+        help="Optional path to save output MP4. If empty, no video is saved.",
+    )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Disable OpenCV display windows (use this in Colab).",
     )
 
     args = parser.parse_args()

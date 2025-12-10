@@ -1,9 +1,27 @@
-ultralytics
-opencv-python
-opencv-contrib-python
-torchreid
-numpy
-filterpy
-scipy
-matplotlib
-tqdm
+# Core deep learning + vision
+torch>=2.1.0
+torchvision>=0.16.0
+
+# YOLO / detector
+ultralytics>=8.0.98
+
+# Multi-object tracking (DeepOCSORT, BoTSORT, etc.)
+boxmot>=10.0.58
+
+# OpenCV (contrib has extra modules; don't install opencv-python as well)
+opencv-contrib-python>=4.8.0
+
+# ReID experiments (your test_torchreid.py etc.)
+torchreid>=0.2.5
+
+# Numerics + utils
+numpy>=1.23.0
+scipy>=1.10.0
+filterpy>=1.4.5
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# Misc utilities used indirectly by Ultralytics/BoxMOT
+pillow>=9.0.0
+pyyaml>=5.4.0
+requests>=2.28.0

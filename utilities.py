@@ -118,9 +118,16 @@ def draw_tracks(image, tracks, ids_dict, src, classes=None):
             # Should never happen with current code, but keep logic
             cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness=2)
         else:
-            centroids[src][global_id] = centroids[src].get(global_id, [])
-            centroids[src][global_id].append(((x1 + x2) // 2, (y1 + y2) // 2))
-            vis = draw_history(vis, box, centroids[src][global_id], color)
+            MAX_TRAIL = 30  # last 30 points (~1.5s at 20 FPS)
+
+            trail = centroids[src].get(global_id, [])
+            trail.append(((x1 + x2) // 2, (y1 + y2) // 2))
+            if len(trail) > MAX_TRAIL:
+                trail.pop(0)
+
+            centroids[src][global_id] = trail
+            vis = draw_history(vis, box, trail, color)
+
 
         # Label text
         if classes is None:
